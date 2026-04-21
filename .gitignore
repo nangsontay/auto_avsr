@@ -8,3 +8,4 @@ outputs/
 *.pyc
 *.tar
 .DS_Store
+/dataset

@@ -21,14 +21,14 @@ SP_MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "spm",
     "unigram",
-    "unigram5000.model",
+    "unigram8000.model",
 )
 
 DICT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "spm",
     "unigram",
-    "unigram5000_units.txt",
+    "unigram8000_units.txt",
 )
 
 
