@@ -153,7 +153,7 @@ class VideoProcess:
         target_size=(256, 256),
         reference_size=(256, 256),
         stable_points=(28, 33, 36, 39, 42, 45, 48, 54),
-        interpolation=cv2.INTER_LINEAR,
+        interpolation=cv2.INTER_LANCZOS4,
         border_mode=cv2.BORDER_CONSTANT,
         border_value=0,
     ):

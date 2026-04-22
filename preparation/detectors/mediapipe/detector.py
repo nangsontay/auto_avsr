@@ -4,15 +4,33 @@
 # Copyright 2021 Imperial College London (Pingchuan Ma)
 # Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
-import mediapipe as mp
 import numpy as np
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.core.base_options import BaseOptions
+
+_MODEL_PATH = "/tmp/blaze_face_short_range.tflite"
+
+# Keypoint indices in mediapipe FaceDetector result
+# 0: right eye, 1: left eye, 2: nose tip, 3: mouth center, 4: right ear, 5: left ear
+_RIGHT_EYE = 0
+_LEFT_EYE = 1
+_NOSE = 2
+_MOUTH = 3
 
 
 class LandmarksDetector:
     def __init__(self):
-        self.mp_face_detection = mp.solutions.face_detection
-        self.short_range_detector = self.mp_face_detection.FaceDetection(min_detection_confidence=0.5, model_selection=0)
-        self.full_range_detector = self.mp_face_detection.FaceDetection(min_detection_confidence=0.5, model_selection=1)
+        options_short = vision.FaceDetectorOptions(
+            base_options=BaseOptions(model_asset_path=_MODEL_PATH),
+            min_detection_confidence=0.5,
+        )
+        options_full = vision.FaceDetectorOptions(
+            base_options=BaseOptions(model_asset_path=_MODEL_PATH),
+            min_detection_confidence=0.5,
+        )
+        self.short_range_detector = vision.FaceDetector.create_from_options(options_short)
+        self.full_range_detector = vision.FaceDetector.create_from_options(options_full)
 
     def __call__(self, video_frames):
         landmarks = self.detect(video_frames, self.full_range_detector)
@@ -22,31 +40,25 @@ class LandmarksDetector:
         return landmarks
 
     def detect(self, video_frames, detector):
+        import mediapipe as mp
         landmarks = []
         for frame in video_frames:
-            results = detector.process(frame)
-            if not results.detections:
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+            result = detector.detect(mp_image)
+            if not result.detections:
                 landmarks.append(None)
                 continue
-            face_points = []
-            for idx, detected_faces in enumerate(results.detections):
-                max_id, max_size = 0, 0
-                bboxC = detected_faces.location_data.relative_bounding_box
-                ih, iw, ic = frame.shape
-                bbox = int(bboxC.xmin * iw), int(bboxC.ymin * ih), int(bboxC.width * iw), int(bboxC.height * ih)
-                bbox_size = (bbox[2] - bbox[0]) + (bbox[3] - bbox[1])
-                if bbox_size > max_size:
-                    max_id, max_size = idx, bbox_size
-                lmx = [
-                    [int(detected_faces.location_data.relative_keypoints[self.mp_face_detection.FaceKeyPoint(0).value].x * iw),
-                     int(detected_faces.location_data.relative_keypoints[self.mp_face_detection.FaceKeyPoint(0).value].y * ih)],
-                    [int(detected_faces.location_data.relative_keypoints[self.mp_face_detection.FaceKeyPoint(1).value].x * iw),
-                     int(detected_faces.location_data.relative_keypoints[self.mp_face_detection.FaceKeyPoint(1).value].y * ih)],
-                    [int(detected_faces.location_data.relative_keypoints[self.mp_face_detection.FaceKeyPoint(2).value].x * iw),
-                     int(detected_faces.location_data.relative_keypoints[self.mp_face_detection.FaceKeyPoint(2).value].y * ih)],
-                    [int(detected_faces.location_data.relative_keypoints[self.mp_face_detection.FaceKeyPoint(3).value].x * iw),
-                     int(detected_faces.location_data.relative_keypoints[self.mp_face_detection.FaceKeyPoint(3).value].y * ih)],
-                    ]
-                face_points.append(lmx)
-            landmarks.append(np.array(face_points[max_id]))
+            # Pick largest face
+            best = max(result.detections, key=lambda d: (
+                d.bounding_box.width * d.bounding_box.height
+            ))
+            ih, iw = frame.shape[:2]
+            kps = best.keypoints
+            lmx = np.array([
+                [kps[_RIGHT_EYE].x * iw, kps[_RIGHT_EYE].y * ih],
+                [kps[_LEFT_EYE].x * iw,  kps[_LEFT_EYE].y * ih],
+                [kps[_NOSE].x * iw,       kps[_NOSE].y * ih],
+                [kps[_MOUTH].x * iw,      kps[_MOUTH].y * ih],
+            ])
+            landmarks.append(lmx)
         return landmarks

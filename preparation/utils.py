@@ -1,5 +1,7 @@
 import os
 
+import cv2
+import numpy as np
 import torchaudio
 import torchvision
 
@@ -95,7 +97,16 @@ def save_vid_aud_txt(
 
 def save2vid(filename, vid, frames_per_second):
     os.makedirs(os.path.dirname(filename), exist_ok=True)
-    torchvision.io.write_video(filename, vid, frames_per_second)
+    if isinstance(vid, np.ndarray) and vid.ndim == 4:
+        h, w = vid.shape[1], vid.shape[2]
+    else:
+        vid = np.array(vid)
+        h, w = vid.shape[1], vid.shape[2]
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(filename, fourcc, frames_per_second, (w, h))
+    for frame in vid:
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    writer.release()
 
 
 def save2aud(filename, aud, sample_rate):

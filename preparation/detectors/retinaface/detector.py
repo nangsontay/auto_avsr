@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore")
 
 
 class LandmarksDetector:
-    def __init__(self, device="cuda:0", model_name="resnet50"):
+    def __init__(self, device="cuda:0", model_name="mobilenet0.25"):
         self.face_detector = RetinaFacePredictor(
             device=device,
             threshold=0.8,

@@ -1,6 +1,8 @@
 import logging
 import os
 from argparse import ArgumentParser
+import torch
+torch.set_float32_matmul_precision('high')
 
 from average_checkpoints import ensemble
 from datamodule.data_module import DataModule
@@ -39,6 +41,7 @@ def get_trainer(args):
         reload_dataloaders_every_n_epochs=1,
         logger=WandbLogger(name=args.exp_name, project="auto_avsr_lipreader", group=args.group_name),
         gradient_clip_val=10.0,
+        precision="16-mixed",
     )
 
 
@@ -199,7 +202,7 @@ def init_logger(debug):
 def cli_main():
     args = parse_args()
     #init_logger(args.debug)
-    args.slurm_job_id = os.environ["SLURM_JOB_ID"]
+    args.slurm_job_id = os.environ.get("SLURM_JOB_ID", 0)
     modelmodule = get_lightning_module(args)
     datamodule = DataModule(args, train_num_buckets=args.train_num_buckets)
     trainer = get_trainer(args)

@@ -1,5 +1,6 @@
 import csv
 import glob
+import os
 import time
 import sys
 
@@ -29,6 +30,12 @@ def is_vietnamese(words):
         return False
     non_ascii = sum(1 for w in words if not w.isascii())
     return non_ascii / len(words) >= 0.4
+
+def delete_corrupted(csv_path):
+    mp4_path = os.path.splitext(csv_path)[0] + '.mp4'
+    for path in (csv_path, mp4_path):
+        if os.path.exists(path):
+            os.remove(path)
 
 def split_long_chain(line):
     parts = []
@@ -92,9 +99,9 @@ with open('input.txt', 'w', encoding = 'utf-8') as out:
                 if word.endswith('.'):
                     words_only = [w for w, _ in current]
                     if is_suspicious(words_only) or not is_vietnamese(words_only):
-                        # discard only words from the corrupted file
                         last_file = current[-1][1]
                         current = [(w, f) for w, f in current if f != last_file]
+                        delete_corrupted(csv_files[last_file])
                         sentences_skipped += 1
                     else:
                         line = ' '.join(words_only)
@@ -110,6 +117,7 @@ with open('input.txt', 'w', encoding = 'utf-8') as out:
         if current:
             words_only = [w for w, _ in current]
             if is_suspicious(words_only) or not is_vietnamese(words_only):
+                delete_corrupted(csv_file)
                 sentences_skipped += 1
             else:
                 line = ' '.join(words_only)

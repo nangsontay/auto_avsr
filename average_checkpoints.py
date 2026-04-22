@@ -26,11 +26,12 @@ def average_checkpoints(last):
 def ensemble(args):
     last = [
         os.path.join(args.exp_dir, args.exp_name, f"epoch={n}.ckpt")
-        for n in range(
-            args.max_epochs - 10,
-            args.max_epochs,
-        )
+        for n in range(args.max_epochs - 10, args.max_epochs)
+        if os.path.exists(os.path.join(args.exp_dir, args.exp_name, f"epoch={n}.ckpt"))
     ]
+    if not last:
+        print("No checkpoints found for ensembling, skipping.")
+        return None
     model_path = os.path.join(args.exp_dir, args.exp_name, f"model_avg_10.pth")
     torch.save(average_checkpoints(last), model_path)
     return model_path

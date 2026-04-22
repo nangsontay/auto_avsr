@@ -7,6 +7,7 @@
 import torch
 import torchaudio
 import torchvision
+from torchcodec.decoders import VideoDecoder
 
 
 class AVSRDataLoader:
@@ -47,7 +48,8 @@ class AVSRDataLoader:
         return waveform, sample_rate
 
     def load_video(self, data_filename):
-        return torchvision.io.read_video(data_filename, pts_unit="sec")[0].numpy()
+        decoder = VideoDecoder(data_filename)
+        return decoder.get_all_frames().data.permute(0, 2, 3, 1).numpy()
 
     def audio_process(self, waveform, sample_rate, target_sample_rate=16000):
         if sample_rate != target_sample_rate:
