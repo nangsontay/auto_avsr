@@ -3,7 +3,7 @@ import glob
 import shutil
 import sys
 
-DATASET = '/home/zap/Downloads/auto_avsr/dataset'
+DATASET = '/workspace/auto_avsr/dataset'
 
 DRY_RUN = '--run' not in sys.argv  # default is dry-run; pass --run to actually move files
 

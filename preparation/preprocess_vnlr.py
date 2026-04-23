@@ -14,7 +14,7 @@ start = time.time()
 DATASET_DIR = '/workspace/dataset'
 OUTPUT_DIR = '/workspace/vnlr'
 LABELS_DIR = '/workspace/labels'
-DONE_LOG = '/workspace/preprocess_done.txt'
+DONE_LOG = '/workspace/auto_avsr/preparation/preprocess_done.txt'
 
 os.makedirs(f"{OUTPUT_DIR}/video", exist_ok=True)
 os.makedirs(f"{OUTPUT_DIR}/text", exist_ok=True)
@@ -110,4 +110,3 @@ elapsed = time.time() - start
 total_done = len(done) + sum(1 for _ in open(DONE_LOG))
 print(f"\nDone in {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
 print(f"Processed: {total_done}/{len(files)} files")
-
