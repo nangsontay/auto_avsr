@@ -29,7 +29,7 @@ RUN git clone --depth 1 --branch n7.1 https://github.com/FFmpeg/FFmpeg.git /tmp/
     ./configure \
       --prefix=/usr/local \
       --enable-shared --disable-static --disable-doc \
-      --enable-gpl --enable-version3 \
+      --enable-gpl --enable-version3 --enable-nonfree \
       --enable-libx264 --enable-libx265 \
       --enable-cuda-nvcc --enable-cuvid --enable-nvenc --enable-nvdec \
       --enable-ffnvcodec \
