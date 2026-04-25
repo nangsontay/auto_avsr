@@ -5,10 +5,22 @@
 # Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 from skimage import transform as tf
+
+# Module-level pool shared across all VideoProcess instances in the same process.
+# cv2 and skimage both release the GIL, so threads give real parallelism here.
+_CROP_POOL: ThreadPoolExecutor | None = None
+_CROP_WORKERS = 8
+
+
+def init_crop_pool(n_workers: int = _CROP_WORKERS):
+    global _CROP_POOL, _CROP_WORKERS
+    _CROP_WORKERS = n_workers
+    _CROP_POOL = ThreadPoolExecutor(max_workers=n_workers)
 
 
 def linear_interpolate(landmarks, start_idx, stop_idx):
@@ -88,33 +100,33 @@ class VideoProcess:
         return sequence
 
     def crop_patch(self, video, landmarks):
-        sequence = []
-        for frame_idx, frame in enumerate(video):
+        def process_frame(frame_idx):
+            frame = video[frame_idx]
             window_margin = min(
                 self.window_margin // 2, frame_idx, len(landmarks) - 1 - frame_idx
             )
             smoothed_landmarks = np.mean(
-                [
-                    landmarks[x]
-                    for x in range(
-                        frame_idx - window_margin, frame_idx + window_margin + 1
-                    )
-                ],
+                [landmarks[x]
+                 for x in range(frame_idx - window_margin, frame_idx + window_margin + 1)],
                 axis=0,
             )
-            smoothed_landmarks += landmarks[frame_idx].mean(
-                axis=0
-            ) - smoothed_landmarks.mean(axis=0)
+            smoothed_landmarks += (landmarks[frame_idx].mean(axis=0)
+                                   - smoothed_landmarks.mean(axis=0))
             transformed_frame, transformed_landmarks = self.affine_transform(
                 frame, smoothed_landmarks, self.reference, grayscale=self.convert_gray
             )
-            patch = cut_patch(
+            return cut_patch(
                 transformed_frame,
                 transformed_landmarks[self.start_idx : self.stop_idx],
                 self.crop_height // 2,
                 self.crop_width // 2,
             )
-            sequence.append(patch)
+
+        n = len(video)
+        if _CROP_POOL is not None and n > 1:
+            sequence = list(_CROP_POOL.map(process_frame, range(n)))
+        else:
+            sequence = [process_frame(i) for i in range(n)]
         return np.array(sequence)
 
     def interpolate_landmarks(self, landmarks):

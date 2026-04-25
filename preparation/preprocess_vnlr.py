@@ -25,14 +25,15 @@ LABELS_DIR   = '/app/labels'
 DONE_LOG     = '/app/preparation/preprocess_done.txt'
 
 NUM_GPUS          = 4
-WORKERS_PER_GPU   = 2     # batched inference saturates GPU compute → fewer workers needed.
-                          # 2 procs/GPU × 4 GPUs = 8 procs. Each runs ~2-3 GB activations comfortably.
-DECODE_THREADS    = 8     # decode threads inside each worker (CPU-bound torchcodec)
-SAVE_THREADS      = 4     # save threads inside each worker (NVENC ~8 session cap/GPU)
-PREFETCH_Q        = 24    # decoded videos buffered per worker
-DET_CHUNK         = 64    # frames per batched RetinaFace forward
-FAN_CHUNK         = 128   # face crops per batched FAN forward
-USE_FP16          = True  # FP16 RetinaFace forward (4090 tensor cores)
+WORKERS_PER_GPU   = 6     # 6 procs/GPU × 4 GPUs = 24 procs
+                          # 192 cores / 24 workers = 8 cores each — plenty for threads below
+DECODE_THREADS    = 6     # 24 × 6 = 144 decode threads total
+CROP_THREADS      = 8     # 24 × 8 = 192 crop threads — fully pins all 192 CPU cores on cv2
+SAVE_THREADS      = 4     # 24 × 4 = 96 save threads (NVENC Blackwell is fast)
+PREFETCH_Q        = 20    # decoded videos buffered per worker
+DET_CHUNK         = 48    # 16 GB VRAM (vs 24 GB) — reduce chunk to stay safe with 6 workers/GPU
+FAN_CHUNK         = 96    # same caution for FAN
+USE_FP16          = True  # Blackwell tensor cores — FP16 is very fast
 USE_NVENC         = True
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -97,8 +98,10 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
     torch.set_grad_enabled(False)
 
     from detectors.retinaface.detector import LandmarksDetector
-    from detectors.retinaface.video_process import VideoProcess
+    from detectors.retinaface.video_process import VideoProcess, init_crop_pool
     from fast_pipeline import BatchedLandmarkPipeline
+
+    init_crop_pool(CROP_THREADS)
 
     landmarks_obj = LandmarksDetector(device='cuda:0')
     video_process = VideoProcess(convert_gray=False)
