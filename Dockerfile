@@ -3,12 +3,22 @@ FROM nvidia/cuda:13.0.0-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget ffmpeg \
+# Install FFmpeg 7.x from jellyfin repo — Ubuntu 22.04 apt ships FFmpeg 4.x
+# which lacks Blackwell (RTX 5090) NVENC support
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg && \
+    curl -fsSL https://repo.jellyfin.org/ubuntu/jellyfin_team.gpg.key \
+      | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/ubuntu jammy main" \
+      > /etc/apt/sources.list.d/jellyfin.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    git wget jellyfin-ffmpeg7 \
     libglib2.0-0 libsm6 libxext6 libxrender1 \
     libgl1-mesa-glx \
     libsndfile1 libportaudio2 \
     python3.10 python3.10-dev python3-pip \
+    gcc \
+    && ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
+    && ln -sf /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
     && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1 \
     && rm -rf /var/lib/apt/lists/*
