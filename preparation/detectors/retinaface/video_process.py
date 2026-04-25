@@ -8,19 +8,13 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
+import kornia.geometry
 import numpy as np
+import torch
+import torch.nn.functional as F
 from skimage import transform as tf
 
-# Module-level pool shared across all VideoProcess instances in the same process.
-# cv2 and skimage both release the GIL, so threads give real parallelism here.
-_CROP_POOL: ThreadPoolExecutor | None = None
-_CROP_WORKERS = 6
-
-
-def init_crop_pool(n_workers: int = _CROP_WORKERS):
-    global _CROP_POOL, _CROP_WORKERS
-    _CROP_WORKERS = n_workers
-    _CROP_POOL = ThreadPoolExecutor(max_workers=n_workers)
+_CROP_WORKERS = 8
 
 
 def linear_interpolate(landmarks, start_idx, stop_idx):
@@ -49,19 +43,15 @@ def apply_transform(transform, img, std_size):
 
 def cut_patch(img, landmarks, height, width, threshold=5):
     center_x, center_y = np.mean(landmarks, axis=0)
-    # Check for too much bias in height and width
     if abs(center_y - img.shape[0] / 2) > height + threshold:
         raise OverflowError("too much bias in height")
     if abs(center_x - img.shape[1] / 2) > width + threshold:
         raise OverflowError("too much bias in width")
-    # Calculate bounding box coordinates
     y_min = int(round(np.clip(center_y - height, 0, img.shape[0])))
     y_max = int(round(np.clip(center_y + height, 0, img.shape[0])))
     x_min = int(round(np.clip(center_x - width, 0, img.shape[1])))
     x_max = int(round(np.clip(center_x + width, 0, img.shape[1])))
-    # Cut the image
-    cutted_img = np.copy(img[y_min:y_max, x_min:x_max])
-    return cutted_img
+    return np.copy(img[y_min:y_max, x_min:x_max])
 
 
 class VideoProcess:
@@ -85,48 +75,165 @@ class VideoProcess:
         self.window_margin = window_margin
         self.convert_gray = convert_gray
 
-    def __call__(self, video, landmarks):
-        # Pre-process landmarks: interpolate frames that are not detected
+        # Stable landmark indices for affine estimation (same as affine_transform default)
+        self._stable_points = (28, 33, 36, 39, 42, 45, 48, 54)
+        # Precompute stable reference as float32 (reference_size == target_size == 256, no offset)
+        self._stable_ref = np.vstack(
+            [self.reference[x] for x in self._stable_points]
+        ).astype(np.float32)
+
+    def __call__(self, video, landmarks, frames_gpu=None):
         preprocessed_landmarks = self.interpolate_landmarks(landmarks)
-        # Exclude corner cases: no landmark in all frames or number of frames is less than window length
         if (
             not preprocessed_landmarks
             or len(preprocessed_landmarks) < self.window_margin
         ):
-            return
-        # Affine transformation and crop patch
+            return None
+
+        if frames_gpu is not None:
+            try:
+                sequence = self.crop_patch_gpu(frames_gpu, preprocessed_landmarks)
+                if sequence is not None:
+                    assert sequence is not None, "crop an empty patch."
+                    return sequence
+            except Exception:
+                pass  # fall through to CPU path
+
         sequence = self.crop_patch(video, preprocessed_landmarks)
         assert sequence is not None, "crop an empty patch."
         return sequence
 
+    # ── GPU path ──────────────────────────────────────────────────────────────
+
+    def crop_patch_gpu(self, frames_gpu, landmarks):
+        """
+        Batch-process all frames on GPU:
+          1. Compute affine matrices on CPU in parallel threads
+             (cv2.estimateAffinePartial2D can't be GPU'd but is fast + parallelisable)
+          2. One kornia.geometry.warp_affine call for all N frames
+          3. Batch landmark transform via GPU matmul
+          4. Vectorised lip crop
+
+        frames_gpu : (N, H, W, 3) uint8 CUDA tensor  (RGB)
+        landmarks  : list of N numpy (68, 2)  — all valid (Nones already interpolated)
+        Returns    : numpy (N, crop_h, crop_w, 3) uint8
+        """
+        N = frames_gpu.shape[0]
+        device = frames_gpu.device
+
+        # ── Step 1: threaded affine matrix computation ────────────────────
+        def compute_M(frame_idx):
+            lm = landmarks[frame_idx]
+            wm = min(self.window_margin // 2, frame_idx, N - 1 - frame_idx)
+            smoothed = np.mean(
+                [landmarks[x] for x in range(frame_idx - wm, frame_idx + wm + 1)],
+                axis=0,
+            )
+            smoothed += lm.mean(0) - smoothed.mean(0)
+            src = np.vstack([smoothed[x] for x in self._stable_points])
+            M, _ = cv2.estimateAffinePartial2D(
+                src, self._stable_ref, method=cv2.LMEDS
+            )
+            return M, smoothed   # M: (2, 3) float64 or None
+
+        with ThreadPoolExecutor(max_workers=_CROP_WORKERS) as pool:
+            results = list(pool.map(compute_M, range(N)))
+
+        # Collect valid frames (M is None if LMEDS fails — very rare)
+        valid_idx   = [i for i, (M, _) in enumerate(results) if M is not None]
+        if not valid_idx:
+            return None
+        Ms           = np.array([results[i][0] for i in valid_idx], dtype=np.float32)
+        smoothed_lms = np.array([results[i][1] for i in valid_idx], dtype=np.float32)
+
+        # ── Step 2: GPU batch warp ────────────────────────────────────────
+        # kornia.geometry.warp_affine uses same convention as cv2.warpAffine (forward M)
+        frames_f = frames_gpu[valid_idx].permute(0, 3, 1, 2).float()   # (V, 3, H, W)
+        M_gpu    = torch.from_numpy(Ms).to(device)                      # (V, 2, 3)
+
+        warped = kornia.geometry.warp_affine(
+            frames_f, M_gpu,
+            dsize=(256, 256),
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        )  # (V, 3, 256, 256)
+
+        # ── Step 3: GPU landmark transform ───────────────────────────────
+        lm_gpu  = torch.from_numpy(smoothed_lms).to(device)            # (V, 68, 2)
+        M_rot   = M_gpu[:, :, :2]                                       # (V, 2, 2)
+        M_tra   = M_gpu[:, :, 2]                                        # (V, 2)
+        lm_w    = torch.bmm(lm_gpu, M_rot.transpose(1, 2)) + M_tra.unsqueeze(1)  # (V, 68, 2)
+
+        # ── Step 4: vectorised lip crop ───────────────────────────────────
+        lip     = lm_w[:, self.start_idx:self.stop_idx, :]             # (V, 20, 2)
+        cx      = lip[:, :, 0].mean(1)                                  # (V,)
+        cy      = lip[:, :, 1].mean(1)                                  # (V,)
+
+        half_h, half_w = self.crop_height // 2, self.crop_width // 2
+
+        # Replicate cut_patch overflow check — raises so caller can skip this clip
+        if (
+            torch.any(torch.abs(cy - 128.0) > half_h + 5) or
+            torch.any(torch.abs(cx - 128.0) > half_w + 5)
+        ):
+            raise OverflowError("too much bias in height/width (GPU path)")
+
+        y0 = (cy - half_h).round().clamp(0, 256).long()
+        y1 = (cy + half_h).round().clamp(0, 256).long()
+        x0 = (cx - half_w).round().clamp(0, 256).long()
+        x1 = (cx + half_w).round().clamp(0, 256).long()
+
+        V = len(valid_idx)
+        patches = torch.empty(V, 3, self.crop_height, self.crop_width,
+                              device=device, dtype=torch.float32)
+        for k in range(V):
+            p = warped[k, :, y0[k]:y1[k], x0[k]:x1[k]]
+            # Boundary clamp can cause ±1 pixel difference — fix with bilinear resize
+            if p.shape[1] != self.crop_height or p.shape[2] != self.crop_width:
+                p = F.interpolate(
+                    p.unsqueeze(0),
+                    (self.crop_height, self.crop_width),
+                    mode='bilinear', align_corners=False,
+                ).squeeze(0)
+            patches[k] = p
+
+        # (V, 3, 96, 96) → (V, 96, 96, 3) → uint8 numpy
+        result_np = patches.permute(0, 2, 3, 1).clamp(0, 255).byte().cpu().numpy()
+
+        if len(valid_idx) == N:
+            return result_np
+
+        # Rare: some frames had no M — fill gaps with nearest valid patch
+        sequence = np.zeros((N, self.crop_height, self.crop_width, 3), dtype=np.uint8)
+        for k, i in enumerate(valid_idx):
+            sequence[i] = result_np[k]
+        return sequence
+
+    # ── CPU fallback path (unchanged) ────────────────────────────────────────
+
     def crop_patch(self, video, landmarks):
         def process_frame(frame_idx):
             frame = video[frame_idx]
-            window_margin = min(
-                self.window_margin // 2, frame_idx, len(landmarks) - 1 - frame_idx
-            )
-            smoothed_landmarks = np.mean(
-                [landmarks[x]
-                 for x in range(frame_idx - window_margin, frame_idx + window_margin + 1)],
+            wm = min(self.window_margin // 2, frame_idx, len(landmarks) - 1 - frame_idx)
+            smoothed = np.mean(
+                [landmarks[x] for x in range(frame_idx - wm, frame_idx + wm + 1)],
                 axis=0,
             )
-            smoothed_landmarks += (landmarks[frame_idx].mean(axis=0)
-                                   - smoothed_landmarks.mean(axis=0))
+            smoothed += landmarks[frame_idx].mean(0) - smoothed.mean(0)
             transformed_frame, transformed_landmarks = self.affine_transform(
-                frame, smoothed_landmarks, self.reference, grayscale=self.convert_gray
+                frame, smoothed, self.reference, grayscale=self.convert_gray
             )
             return cut_patch(
                 transformed_frame,
-                transformed_landmarks[self.start_idx : self.stop_idx],
+                transformed_landmarks[self.start_idx:self.stop_idx],
                 self.crop_height // 2,
-                self.crop_width // 2,
+                self.crop_width  // 2,
             )
 
         n = len(video)
-        if _CROP_POOL is not None and n > 1:
-            sequence = list(_CROP_POOL.map(process_frame, range(n)))
-        else:
-            sequence = [process_frame(i) for i in range(n)]
+        with ThreadPoolExecutor(max_workers=_CROP_WORKERS) as pool:
+            sequence = list(pool.map(process_frame, range(n)))
         return np.array(sequence)
 
     def interpolate_landmarks(self, landmarks):
@@ -143,7 +250,6 @@ class VideoProcess:
 
         valid_frames_idx = [idx for idx, lm in enumerate(landmarks) if lm is not None]
 
-        # Handle corner case: keep frames at the beginning or at the end that failed to be detected
         if valid_frames_idx:
             landmarks[: valid_frames_idx[0]] = [
                 landmarks[valid_frames_idx[0]]
@@ -152,8 +258,7 @@ class VideoProcess:
                 len(landmarks) - valid_frames_idx[-1]
             )
 
-        assert all(lm is not None for lm in landmarks), "not every frame has landmark"
-
+        assert all(lm is not None for lm in landmarks)
         return landmarks
 
     def affine_transform(
@@ -178,20 +283,12 @@ class VideoProcess:
             landmarks, stable_points, stable_reference
         )
         transformed_frame, transformed_landmarks = self.apply_affine_transform(
-            frame,
-            landmarks,
-            transform,
-            target_size,
-            interpolation,
-            border_mode,
-            border_value,
+            frame, landmarks, transform, target_size,
+            interpolation, border_mode, border_value,
         )
-
         return transformed_frame, transformed_landmarks
 
-    def get_stable_reference(
-        self, reference, stable_points, reference_size, target_size
-    ):
+    def get_stable_reference(self, reference, stable_points, reference_size, target_size):
         stable_reference = np.vstack([reference[x] for x in stable_points])
         stable_reference[:, 0] -= (reference_size[0] - target_size[0]) / 2.0
         stable_reference[:, 1] -= (reference_size[1] - target_size[1]) / 2.0
@@ -205,18 +302,11 @@ class VideoProcess:
         )[0]
 
     def apply_affine_transform(
-        self,
-        frame,
-        landmarks,
-        transform,
-        target_size,
-        interpolation,
-        border_mode,
-        border_value,
+        self, frame, landmarks, transform, target_size,
+        interpolation, border_mode, border_value,
     ):
         transformed_frame = cv2.warpAffine(
-            frame,
-            transform,
+            frame, transform,
             dsize=(target_size[0], target_size[1]),
             flags=interpolation,
             borderMode=border_mode,
