@@ -1,0 +1,22 @@
+# Large data/output dirs — mount these at runtime instead
+dataset/
+exp/
+wandb/
+.claude/
+*.pth
+*.pt
+*.tar
+*.tar.gz
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Logs
+*.log
+tea_debug.log
+
+# Local env artifacts
+.env

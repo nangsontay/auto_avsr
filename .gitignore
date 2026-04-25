@@ -15,4 +15,6 @@ spm/input _bak.txt
 tea_debug.log
 vsr_trlrs3vox2_base.pth
 /wandb
-# /vnlr
+
+onstart.sh
+ports.log
