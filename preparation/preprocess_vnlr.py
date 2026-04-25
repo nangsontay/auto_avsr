@@ -26,16 +26,15 @@ LABELS_DIR   = '/app/labels'
 DONE_LOG     = '/app/preparation/preprocess_done.txt'
 
 NUM_GPUS          = 4
-WORKERS_PER_GPU   = 4     # 16 procs total (4 × 4)
+WORKERS_PER_GPU   = 2     # 8 procs total (4 × 2) — 4 workers × ~6-8 GB VRAM each OOMs 24 GB GPUs
 DECODE_THREADS    = 4     # per worker — mostly I/O wait, ok to oversubscribe
 CROP_WORKERS      = 3     # per worker — pipeline stage: GPU runs while these crop previous video
-                          # 16 × 3 = 48 crop threads = exactly all CPU cores
 SAVE_THREADS      = 3     # per worker
 PREFETCH_Q        = 16    # decoded frames waiting for GPU
 CROP_Q_DEPTH      = 8     # (frames, landmarks) pairs waiting for crop workers
 SAVE_Q_DEPTH      = 16    # cropped videos waiting to save
-DET_CHUNK         = 96    # 4090: 24 GB VRAM, 4 workers → plenty of headroom
-FAN_CHUNK         = 192
+DET_CHUNK         = 128   # 4090: 24 GB VRAM, 2 workers → more headroom per worker
+FAN_CHUNK         = 256
 USE_FP16          = True
 USE_COMPILE       = True  # torch.compile RetinaFace + FAN (~20-40% faster inference)
 USE_NVENC         = True
@@ -275,8 +274,10 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
 
             try:
                 landmarks, frames_gpu = fast_pipeline(frames)
-            except Exception:
-                print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - INFER-ERR   {name}", flush=True)
+            except Exception as _infer_exc:
+                import traceback as _tb
+                print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - INFER-ERR   {name} | {type(_infer_exc).__name__}: {_infer_exc!s:.200}", flush=True)
+                _tb.print_exc()
                 done_log.write(name + '\n'); done_log.flush()
                 continue
 
@@ -366,7 +367,7 @@ if __name__ == '__main__':
 
     # Probe NVENC once so workers know whether to attempt it
     import numpy as _np
-    _probe = _np.zeros((4, 16, 16, 3), dtype=_np.uint8)
+    _probe = _np.zeros((4, 256, 256, 3), dtype=_np.uint8)
     try:
         _write_video_pyav('/tmp/_nvenc_probe.mp4', _probe, 25,
                           'h264_nvenc', {'preset': 'p1', 'gpu': '0'})

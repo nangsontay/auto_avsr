@@ -16,6 +16,9 @@ tea_debug.log
 vsr_trlrs3vox2_base.pth
 wandb/
 
+labels/
+vnlr/
+
 onstart.sh
 ports.log
 face_detection/
