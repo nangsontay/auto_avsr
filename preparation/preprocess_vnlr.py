@@ -5,6 +5,7 @@ import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from glob import glob
+import multiprocessing
 from multiprocessing import Manager, Pool
 from pathlib import Path
 
@@ -345,6 +346,10 @@ def load_done_set():
 
 
 if __name__ == '__main__':
+    # 'spawn' creates clean child processes with no inherited CUDA state.
+    # 'fork' (Linux default) copies the parent's file descriptors and can
+    # corrupt the CUDA driver context that torch initialises at import time.
+    multiprocessing.set_start_method('spawn', force=True)
     start = time.time()
 
     # Create all required directories upfront
