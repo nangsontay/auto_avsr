@@ -316,9 +316,17 @@ def load_done_set():
 if __name__ == '__main__':
     start = time.time()
 
-    os.makedirs(f"{OUTPUT_DIR}/video", exist_ok=True)
-    os.makedirs(f"{OUTPUT_DIR}/text",  exist_ok=True)
-    os.makedirs(LABELS_DIR,            exist_ok=True)
+    # Create all required directories upfront
+    for dirpath in [
+        DATASET_DIR,
+        f"{OUTPUT_DIR}/video",
+        f"{OUTPUT_DIR}/text",
+        LABELS_DIR,
+        str(Path(DONE_LOG).parent),
+    ]:
+        if not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+            print(f"Created directory: {dirpath}")
 
     files = sorted(glob(f'{DATASET_DIR}/*.mp4'))
     print(f"Found {len(files)} files in {DATASET_DIR}")
