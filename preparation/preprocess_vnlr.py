@@ -25,15 +25,16 @@ LABELS_DIR   = '/app/labels'
 DONE_LOG     = '/app/preparation/preprocess_done.txt'
 
 NUM_GPUS          = 4
-WORKERS_PER_GPU   = 6     # 6 procs/GPU × 4 GPUs = 24 procs
-                          # 192 cores / 24 workers = 8 cores each — plenty for threads below
-DECODE_THREADS    = 6     # 24 × 6 = 144 decode threads total
-CROP_THREADS      = 8     # 24 × 8 = 192 crop threads — fully pins all 192 CPU cores on cv2
-SAVE_THREADS      = 4     # 24 × 4 = 96 save threads (NVENC Blackwell is fast)
-PREFETCH_Q        = 20    # decoded videos buffered per worker
-DET_CHUNK         = 48    # 16 GB VRAM (vs 24 GB) — reduce chunk to stay safe with 6 workers/GPU
-FAN_CHUNK         = 96    # same caution for FAN
-USE_FP16          = True  # Blackwell tensor cores — FP16 is very fast
+WORKERS_PER_GPU   = 4     # 4 procs/GPU × 4 GPUs = 16 procs
+                          # 48 cores / 16 workers = 3 cores per worker (sweet spot)
+DECODE_THREADS    = 4     # 16 × 4 = 64 decode threads (mostly I/O wait, ok to oversubscribe)
+CROP_THREADS      = 6     # 16 × 6 = 96 crop threads on 48 cores
+                          #   cv2 releases GIL — slight oversubscribe keeps cores 100% pegged
+SAVE_THREADS      = 3     # 16 × 3 = 48 save threads (NVENC session-bound)
+PREFETCH_Q        = 24    # 16 workers × 24 × ~60 MB ≈ 23 GB RAM (fine with 257 GB available)
+DET_CHUNK         = 96    # 24 GB/GPU — 4 workers × ~1.5 GB activations = 6 GB used (lots of room)
+FAN_CHUNK         = 192   # same — push it; 4090 tensor cores devour this
+USE_FP16          = True  # 4090 tensor cores — FP16 is ~2× FP32
 USE_NVENC         = True
 # ──────────────────────────────────────────────────────────────────────────────
 

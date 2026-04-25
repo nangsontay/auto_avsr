@@ -14,7 +14,7 @@ from skimage import transform as tf
 # Module-level pool shared across all VideoProcess instances in the same process.
 # cv2 and skimage both release the GIL, so threads give real parallelism here.
 _CROP_POOL: ThreadPoolExecutor | None = None
-_CROP_WORKERS = 8
+_CROP_WORKERS = 6
 
 
 def init_crop_pool(n_workers: int = _CROP_WORKERS):
