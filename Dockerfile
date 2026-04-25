@@ -2,6 +2,7 @@ FROM nvidia/cuda:13.0.0-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
 # Install FFmpeg 7.x from jellyfin repo — Ubuntu 22.04 apt ships FFmpeg 4.x
 # which lacks Blackwell (RTX 5090) NVENC support
