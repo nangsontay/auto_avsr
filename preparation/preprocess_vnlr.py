@@ -17,10 +17,10 @@ from torchcodec.decoders import VideoDecoder
 from transforms import TextTransform
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATASET_DIR = '/workspace/dataset'
-OUTPUT_DIR  = '/workspace/vnlr'
-LABELS_DIR  = '/workspace/labels'
-DONE_LOG    = '/workspace/auto_avsr/preparation/preprocess_done.txt'
+DATASET_DIR = '/app/dataset'
+OUTPUT_DIR = '/app/vnlr'
+LABELS_DIR = '/app/labels'
+DONE_LOG = '/app/preparation/preprocess_done.txt'
 
 NUM_GPUS         = 4
 IO_THREADS       = 8   # prefetch/decode threads per worker (Samsung 990 Pro: 6 GB/s, easily feeds 8)
