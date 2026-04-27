@@ -1,0 +1,35 @@
+# docker-compose.yml
+services:
+  preprocess:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vsr_app:latest
+    container_name: vsr_pipeline
+    restart: unless-stopped
+    runtime: nvidia                    # nếu dùng nvidia-container-toolkit cũ
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all              # hoặc count: 1, hoặc device_ids: ['0']
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Dataset gốc (read-only để an toàn)
+      - /data/gdrive/VNLR/VNLR:/app/dataset:ro
+      # Output crops (.mp4) — đã được rclone backup
+      - /data/gdrive/VNLR/output:/app/vnlr
+      # Labels CSV — đã được rclone backup
+      - /data/gdrive/VNLR/labels:/app/labels
+      # ⬇️ MỚI: resume state — sẽ được rclone backup
+      - /data/gdrive/VNLR/resume_state:/app/resume_state
+    working_dir: /app/preparation
+    command: python preprocess_vnlr.py
+    shm_size: '8gb'                   # tránh "bus error" khi DataLoader nhiều worker
+    ulimits:
+      memlock: -1
+      stack: 67108864

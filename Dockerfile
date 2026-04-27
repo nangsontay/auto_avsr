@@ -1,62 +1,62 @@
-# Base: latest CUDA 12.8 + cuDNN 9, khớp cu128 wheel của PyTorch mới nhất
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+# Base: CUDA 12.6 + cuDNN 9.
+# IMPORTANT: cu126 wheel index hỗ trợ Maxwell→Hopper (bao gồm Volta sm_70 / V100).
+# Wheel cu128/cu130 đã loại bỏ sm_70 — không dùng được trên V100.
+# Tham khảo: https://github.com/pytorch/pytorch/blob/main/RELEASE.md (Release Compatibility Matrix)
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
 # Bypass cuDNN 9 frontend "FIND" path.
-# cuDNN 9.5+ đã loại bỏ một số precompiled engine cho Volta (sm_70 / V100),
-# khiến `torch.jit.trace` của FANPredictor lỗi "FIND was unable to find an engine".
-# Env này ép cuDNN dùng v7-style algorithm finder (vẫn có engine cho Volta).
+# Phòng hờ trên Volta (V100/Titan V/Quadro GV100): một số bản cuDNN 9.x
+# có thể không tìm được engine convolution cho sm_70 trong torch.jit.trace.
 # Vô hại trên Ampere/Hopper/Ada/Blackwell.
 ENV TORCH_CUDNN_V8_API_DISABLED=1
 
-# Install build deps + runtime libs
+# Giảm fragmentation cho cấp phát CUDA của PyTorch.
+# expandable_segments=True cho phép caching allocator nới rộng segment hiện có
+# thay vì giữ nguyên các block đã reserve nhưng không cấp phát được — giải pháp
+# trực tiếp cho lỗi "1.48 GiB reserved by PyTorch but unallocated" trên GPU 16 GB.
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# OS deps tối thiểu (đã loại nasm/yasm/x264-dev/x265-dev — không còn build FFmpeg)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git wget curl gnupg ca-certificates \
-        build-essential nasm yasm pkg-config \
+        build-essential pkg-config \
         libglib2.0-0 libsm6 libxext6 libxrender1 \
         libgl1-mesa-glx \
         libsndfile1 libportaudio2 \
-        libx264-dev libx265-dev \
         python3.10 python3.10-dev python3-pip \
         gcc \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
     && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1 \
     && rm -rf /var/lib/apt/lists/*
 
-# nv-codec-headers tương thích CUDA 12.8 SDK
-RUN git clone --depth 1 --branch n13.0.19.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nv-codec-headers \
-    && make -C /tmp/nv-codec-headers install \
-    && rm -rf /tmp/nv-codec-headers
-
-# Build FFmpeg 7.1.1 từ source (có NVENC/NVDEC, x264, x265).
-# Chọn 7.x vì torchcodec stable đang ship libtorchcodec_core7.so.
-RUN git clone --depth 1 --branch n7.1.1 https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg \
-    && cd /tmp/ffmpeg \
-    && ./configure \
-        --prefix=/usr/local \
-        --enable-shared --disable-static --disable-doc \
-        --enable-gpl --enable-version3 --enable-nonfree \
-        --enable-libx264 --enable-libx265 \
-        --enable-cuvid --enable-nvenc --enable-nvdec \
-        --enable-ffnvcodec \
-        --extra-cflags="-I/usr/local/cuda/include" \
-        --extra-ldflags="-L/usr/local/cuda/lib64" \
-    && make -j"$(nproc)" \
-    && make install \
+# FFmpeg 7 với NVENC/NVDEC từ Jellyfin APT repo (~30 giây, thay vì ~15 phút build từ source).
+# Jellyfin-ffmpeg7 đã build với --enable-nvenc --enable-libx264 --enable-libx265 --enable-cuvid.
+# `apt-key` không dùng nữa trên Ubuntu 22.04 → key bỏ vào /usr/share/keyrings.
+RUN curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/jellyfin.gpg] \
+              https://repo.jellyfin.org/ubuntu jammy main" \
+        > /etc/apt/sources.list.d/jellyfin.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends jellyfin-ffmpeg7 \
+    && ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg  /usr/local/bin/ffmpeg \
+    && ln -sf /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
+    && echo "/usr/lib/jellyfin-ffmpeg/lib" > /etc/ld.so.conf.d/jellyfin-ffmpeg.conf \
     && ldconfig \
-    && rm -rf /tmp/ffmpeg
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Cài PyTorch stack từ cu128 wheel index TRƯỚC các deps khác,
-# để torch + torchvision + torchaudio + torchcodec luôn khớp ABI
-# và pip resolver không "downgrade ngược" khi cài requirements.txt.
+RUN mkdir -p /app/resume_state /app/vnlr /app/labels /app/dataset
+# PyTorch stack — cài từ cu126 wheel index trước các deps khác.
+# Không pin version: pip resolver tự chọn bản torch + torchcodec mới nhất trong cu126.
+# Đảm bảo torch + torchvision + torchaudio + torchcodec luôn khớp ABI.
 RUN pip install --no-cache-dir --upgrade pip wheel setuptools \
     && pip install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cu128 \
+        --index-url https://download.pytorch.org/whl/cu126 \
         torch torchvision torchaudio torchcodec
 
 # Các Python deps còn lại (đã loại bỏ torch* và triton khỏi requirements.txt)

@@ -72,12 +72,22 @@ class BatchedLandmarkPipeline:
         top_boxes_all  = []
         top_scores_all = []
 
-        for i in range(0, N, self.det_chunk):
-            chunk = frames_bgr[i:i + self.det_chunk]
-            x = chunk.permute(0, 3, 1, 2).float() - self._mean
-            if self.fp16:
-                x = x.half()
-            loc, conf, _ = self.face_net(x)
+        # Adaptive chunk: nếu RetinaFace forward OOM, chia đôi det_chunk cho phần còn lại.
+        i = 0
+        det_chunk = self.det_chunk
+        while i < N:
+            try:
+                chunk = frames_bgr[i:i + det_chunk]
+                x = chunk.permute(0, 3, 1, 2).float() - self._mean
+                if self.fp16:
+                    x = x.half()
+                loc, conf, _ = self.face_net(x)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if det_chunk == 1:
+                    raise
+                det_chunk = max(1, det_chunk // 2)
+                continue
             scores = conf[..., 1].float()
             top_score, top_idx = scores.max(dim=1)
 
@@ -94,6 +104,7 @@ class BatchedLandmarkPipeline:
                                   cx + w_/2, cy + h_/2], dim=1) * scale_box
             top_boxes_all.append(boxes)
             top_scores_all.append(top_score)
+            i += det_chunk
 
         boxes_np  = torch.cat(top_boxes_all).cpu().numpy()
         scores_np = torch.cat(top_scores_all).cpu().numpy()
@@ -144,11 +155,25 @@ class BatchedLandmarkPipeline:
             patches.transpose(0, 3, 1, 2).copy()
         ).to(self.device, non_blocking=True).float() / 255.0
 
-        # Chunked FAN forward
+        # Chunked FAN forward — với adaptive OOM retry.
+        # Nếu một chunk gây CUDA OOM, ta empty_cache() và chia đôi chunk size cho
+        # phần còn lại của video. Chỉ raise khi đã chunk = 1 mà vẫn OOM (lúc đó
+        # GPU thực sự không đủ VRAM cho cả 1 patch — không cứu được).
         all_lm = []
-        for i in range(0, patches_t.size(0), self.fan_chunk):
-            heatmaps, _, _ = self.fan_net(patches_t[i:i + self.fan_chunk])
-            all_lm.append(self._decode_fan(heatmaps))
+        i = 0
+        chunk = self.fan_chunk
+        N_patch = patches_t.size(0)
+        while i < N_patch:
+            try:
+                heatmaps, _, _ = self.fan_net(patches_t[i:i + chunk])
+                all_lm.append(self._decode_fan(heatmaps))
+                i += chunk
+            except torch.cuda.OutOfMemoryError:
+                # Giải phóng buffer và thử với chunk nhỏ hơn
+                torch.cuda.empty_cache()
+                if chunk == 1:
+                    raise
+                chunk = max(1, chunk // 2)
         landmarks_dec = torch.cat(all_lm).cpu().numpy()
 
         hh = hw = input_size // 4  # FAN heatmap stride = 4
