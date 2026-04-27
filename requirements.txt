@@ -90,13 +90,8 @@ soupsieve
 sympy
 threadpoolctl
 tifffile
-torch
-torchaudio
-torchcodec
 torchmetrics
-torchvision
 tqdm
-triton
 typer
 typing-extensions
 typing-inspection

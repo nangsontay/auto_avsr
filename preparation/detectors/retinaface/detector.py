@@ -6,10 +6,35 @@
 
 import warnings
 
+import torch
+
 from ibug.face_alignment import FANPredictor
 from ibug.face_detection import RetinaFacePredictor
 
 warnings.filterwarnings("ignore")
+
+
+def _is_volta_gpu(device: str) -> bool:
+    """Return True if the given CUDA device is a Volta-class GPU (sm_70).
+
+    cuDNN 9.5+ removed several precompiled convolution engines for sm_70,
+    causing `torch.jit.trace` inside FANPredictor to raise
+    "RuntimeError: FIND was unable to find an engine to execute this computation".
+    We detect Volta and turn cuDNN off only for the trace step.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if not isinstance(device, str) or not device.startswith("cuda"):
+        return False
+    try:
+        idx = int(device.split(":", 1)[1]) if ":" in device else 0
+    except (ValueError, IndexError):
+        idx = 0
+    try:
+        major, minor = torch.cuda.get_device_capability(idx)
+    except Exception:
+        return False
+    return (major, minor) == (7, 0)
 
 
 class LandmarksDetector:
@@ -19,7 +44,18 @@ class LandmarksDetector:
             threshold=0.8,
             model=RetinaFacePredictor.get_model(model_name),
         )
-        self.landmark_detector = FANPredictor(device=device, model=None)
+
+        # Defensive guard: on Volta (V100 / Titan V / Quadro GV100) the cuDNN 9
+        # engine finder can fail during torch.jit.trace inside FANPredictor.
+        # Disable cuDNN only for the trace, then restore it so other models
+        # (e.g. RetinaFace already constructed above) keep full performance.
+        prev_cudnn_enabled = torch.backends.cudnn.enabled
+        if _is_volta_gpu(device):
+            torch.backends.cudnn.enabled = False
+        try:
+            self.landmark_detector = FANPredictor(device=device, model=None)
+        finally:
+            torch.backends.cudnn.enabled = prev_cudnn_enabled
 
     def __call__(self, video_frames):
         landmarks = []
