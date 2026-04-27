@@ -25,8 +25,8 @@ OUTPUT_DIR   = '/app/vnlr'
 LABELS_DIR   = '/app/labels'
 DONE_LOG     = '/app/preparation/preprocess_done.txt'
 
-NUM_GPUS          = 4
-WORKERS_PER_GPU   = 2     # 8 procs total (4 × 2) — 4 workers × ~6-8 GB VRAM each OOMs 24 GB GPUs
+NUM_GPUS          = 1
+WORKERS_PER_GPU   = 1     # 8 procs total (4 × 2) — 4 workers × ~6-8 GB VRAM each OOMs 24 GB GPUs
 DECODE_THREADS    = 4     # per worker — mostly I/O wait, ok to oversubscribe
 CROP_WORKERS      = 3     # per worker — pipeline stage: GPU runs while these crop previous video
 SAVE_THREADS      = 3     # per worker
@@ -34,10 +34,10 @@ PREFETCH_Q        = 16    # decoded frames waiting for GPU
 CROP_Q_DEPTH      = 8     # (frames, landmarks) pairs waiting for crop workers
 SAVE_Q_DEPTH      = 16    # cropped videos waiting to save
 DET_CHUNK         = 128   # 4090: 24 GB VRAM, 2 workers → more headroom per worker
-FAN_CHUNK         = 256
+FAN_CHUNK         = 192
 USE_FP16          = True
-USE_COMPILE       = True  # torch.compile RetinaFace + FAN (~20-40% faster inference)
-USE_NVENC         = True
+USE_COMPILE       = False  # torch.compile RetinaFace + FAN (~20-40% faster inference)
+USE_NVENC         = False
 # ──────────────────────────────────────────────────────────────────────────────
 
 
