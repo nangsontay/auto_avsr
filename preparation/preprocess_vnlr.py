@@ -41,8 +41,8 @@ FAN_CHUNK         = 512    # FAN batch — chunk peak VRAM cao nhất, cần gi�
 RETRY_DET_CHUNK   = 32    # rất bảo thủ — clip bị OOM thường rất dài/HD
 RETRY_FAN_CHUNK   = 48
 USE_FP16          = True
-USE_COMPILE       = False # CUDA Graphs giữ private memory pool gây fragmentation khi share GPU
-USE_NVENC         = False # h264_nvenc tốn 200-500 MiB VRAM trên cùng GPU đang inference
+USE_COMPILE       = True # CUDA Graphs giữ private memory pool gây fragmentation khi share GPU
+USE_NVENC         = True # h264_nvenc tốn 200-500 MiB VRAM trên cùng GPU đang inference
 # OOM-retry behaviour ─────────────────────────────────────────────
 OOM_MAX_ATTEMPTS  = 3     # số lần thử lại 1 video khi gặp CUDA OOM trước khi defer sang retry pass
 OOM_BACKOFF_SEC   = 1.5   # giây chờ giữa các lần retry (cho sibling worker thoát đỉnh peak)
