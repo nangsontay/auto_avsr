@@ -93,11 +93,29 @@ def save2vid(filename, vid, fps):
 _SENTINEL = object()
 
 
+def _is_cuda_oom(exc):
+    """Return True if `exc` represents a CUDA out-of-memory condition.
+
+    Catches both:
+      - `torch.cuda.OutOfMemoryError` (raw eager-mode OOM)
+      - `RuntimeError` re-wrapped by the TorchScript interpreter when OOM
+        happens inside a scripted/compiled module (e.g. fan_net). The wrapped
+        message still contains 'CUDA out of memory' / 'out of memory'.
+    """
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return ('out of memory' in msg) or ('cuda error: out of memory' in msg)
+    return False
+
+
 def _infer_with_oom_retry(fast_pipeline, frames,
                           max_attempts=None, backoff_sec=None):
     """Run fast_pipeline(frames) with adaptive OOM retry.
 
-    Strategy on torch.cuda.OutOfMemoryError:
+    Strategy on torch.cuda.OutOfMemoryError (or RuntimeError-wrapped OOM from
+    TorchScript):
       1. empty_cache + synchronize to release any partial allocations.
       2. Sleep `backoff_sec * (attempt+1)` so the sibling worker on the same
          GPU has time to drain its own peak (when 2 workers/GPU contend, the
@@ -105,8 +123,9 @@ def _infer_with_oom_retry(fast_pipeline, frames,
       3. Halve det_chunk and fan_chunk for the next attempt (mutating the
          pipeline in place; restored in finally).
 
-    Raises torch.cuda.OutOfMemoryError if all attempts fail — caller should
+    Raises the original OOM exception if all attempts fail — caller should
     defer the file to the OOM retry log for a single-worker pass at the end.
+    Non-OOM RuntimeErrors are propagated immediately without retry.
     """
     if max_attempts is None:
         max_attempts = OOM_MAX_ATTEMPTS
@@ -120,7 +139,12 @@ def _infer_with_oom_retry(fast_pipeline, frames,
         for attempt in range(max_attempts):
             try:
                 return fast_pipeline(frames)
-            except torch.cuda.OutOfMemoryError as e:
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                # Chỉ retry nếu thực sự là OOM (kể cả khi bị TorchScript bọc
+                # thành RuntimeError). RuntimeError không phải OOM phải ném
+                # ra ngoài luôn để caller xử lý đúng (INFER-ERR).
+                if not _is_cuda_oom(e):
+                    raise
                 last_exc = e
                 try:
                     torch.cuda.empty_cache()
@@ -138,9 +162,17 @@ def _infer_with_oom_retry(fast_pipeline, frames,
 
 
 def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
-           done_set, lock, counters, start_time, retry_mode=False):
-    # ── CPU pinning ─────────────────────────────────────────────────────────
-    total_workers   = NUM_GPUS * WORKERS_PER_GPU
+           done_set, lock, counters, start_time, retry_mode=False,
+           total_workers=None, nvenc_ok=True):
+    # ── NVENC availability (BUG 2 fix) ─────────────────────────────────────
+    # 'spawn' workers re-import the module so module-level _NVENC_OK is reset
+    # to the default True. We propagate the parent's probe result here.
+    global _NVENC_OK
+    _NVENC_OK = bool(nvenc_ok)
+
+    # ── CPU pinning (BUG 4 fix: dùng total_workers thực, không phải config) ─
+    if total_workers is None:
+        total_workers = NUM_GPUS * WORKERS_PER_GPU
     total_cores     = psutil.cpu_count(logical=True)
     cores_per_worker = max(1, total_cores // total_workers)
     cpu_start = worker_id * cores_per_worker
@@ -189,6 +221,26 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
     # tránh đệ quy vô hạn — OOM ở pass retry sẽ ghi vào done_log như INFER-ERR.
     oom_log   = open(f"{OOM_LOG}.{log_suffix}", "a") if not retry_mode else None
 
+    # ── BUG 1 fix: thread-safe file writes ─────────────────────────────────
+    # CSV rows can exceed PIPE_BUF (4096B) when `ids` is long → 3 save_consumer
+    # threads writing concurrently can interleave bytes mid-row, corrupting
+    # train/val/test.csv. done_log/oom_log writes are short but written by 8+
+    # threads (GPU loop + crop_consumer×6 + save_consumer×3) — safer with lock.
+    csv_lock = threading.Lock()
+    log_lock = threading.Lock()
+
+    def _write_done(name):
+        with log_lock:
+            done_log.write(name + '\n'); done_log.flush()
+
+    def _write_oom(path):
+        with log_lock:
+            oom_log.write(path + '\n'); oom_log.flush()
+
+    def _write_csv(handle, row):
+        with csv_lock:
+            handle.write(row); handle.flush()
+
     total_files  = counters['total']
     initial_done = counters['initial_done']
 
@@ -196,14 +248,24 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
     decode_q = queue.Queue(maxsize=PREFETCH_Q)
 
     def decode_one(f):
-        name = Path(f).name
-        if name in done_set:
-            decode_q.put((f, 'resume', None))
-            return
+        # BUG 8 fix: outer try/except guarantees decode_q ALWAYS receives an
+        # entry per file — without it, a freak error in Path(f).name or in
+        # decode_q.put would leave `pending` counter unsatisfied and the main
+        # GPU loop would hang forever on decode_q.get().
         try:
-            decode_q.put((f, 'ok', load_video(f)))
+            name = Path(f).name
+            if name in done_set:
+                decode_q.put((f, 'resume', None))
+                return
+            try:
+                decode_q.put((f, 'ok', load_video(f)))
+            except Exception:
+                decode_q.put((f, 'error', None))
         except Exception:
-            decode_q.put((f, 'error', None))
+            try:
+                decode_q.put((f, 'error', None))
+            except Exception:
+                pass
 
     def decode_producer():
         with ThreadPoolExecutor(max_workers=DECODE_THREADS) as pool:
@@ -240,22 +302,27 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
                 video_data = video_process(frames, landmarks, frames_gpu=frames_gpu)
             except (OverflowError, TypeError, AssertionError, UnboundLocalError):
                 print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - CROP-ERR    {name}", flush=True)
-                done_log.write(name + '\n'); done_log.flush()
+                _write_done(name)
                 continue
 
             if video_data is None:
                 print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - NO-FACE     {name}", flush=True)
-                done_log.write(name + '\n'); done_log.flush()
+                _write_done(name)
                 continue
 
-            csv_path = f.replace('.mp4', '.csv')
+            # BUG 5 fix: with_suffix() chỉ thay extension cuối, an toàn với path
+            # có chuỗi '.mp4' ở giữa (vd. /archive.mp4_v2/clip.mp4).
+            csv_path = str(Path(f).with_suffix('.csv'))
             try:
                 transcript = []
                 with open(csv_path) as csvfile:
                     for row in csv.DictReader(csvfile):
                         transcript.append(row['Word'].strip().rstrip('.,!?\'"').lower())
             except FileNotFoundError:
-                done_log.write(name + '\n'); done_log.flush()
+                # BUG 3 fix: trước đây file bị drop âm thầm; thêm log NO-CSV
+                # để user biết vì sao thiếu — nhất quán với các nhánh lỗi khác.
+                print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - NO-CSV      {name}", flush=True)
+                _write_done(name)
                 continue
 
             text = ' '.join(transcript)
@@ -287,17 +354,26 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
 
             speaker = Path(f).stem.rsplit('_', 1)[0]
             row     = f"vnlr,video/{name},{len(video_tensor)},{ids}\n"
+            # BUG 1 fix: dùng _write_csv để lock — tránh interleave dòng dài
+            # khi 3 save_consumer thread cùng ghi train/val/test.csv.
             if speaker in train_set:
-                train_csv.write(row); train_csv.flush()
+                _write_csv(train_csv, row)
             elif speaker in val_set:
-                val_csv.write(row);   val_csv.flush()
+                _write_csv(val_csv, row)
             elif speaker in test_set:
-                test_csv.write(row);  test_csv.flush()
+                _write_csv(test_csv, row)
 
-            done_log.write(name + '\n'); done_log.flush()
+            # BUG 6 lưu ý: ghi done_log SAU CSV để nếu crash giữa 2 lệnh,
+            # dedup trong merge_shards sẽ loại trùng (xem _dedup_csv).
+            _write_done(name)
+            # BUG 7 fix: idx ở GPU loop là "dispatch idx", có thể vượt xa số file
+            # đã thực sự lưu. Dùng counter 'saved' riêng cho thông báo OK.
+            with lock:
+                counters['saved'] = counters.get('saved', 0) + 1
+                saved_idx = counters['saved']
             elapsed = time.time() - start_time
             ts = time.strftime('%H:%M:%S', time.gmtime(elapsed))
-            print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - OK   {name}", flush=True)
+            print(f"[{ts}] {saved_idx}/{total_files} W{worker_id}/G{gpu_id} - OK   {name}", flush=True)
 
     crop_threads = [threading.Thread(target=crop_consumer, daemon=True)
                     for _ in range(CROP_WORKERS)]
@@ -330,34 +406,40 @@ def worker(worker_id, gpu_id, file_chunk, train_set, val_set, test_set,
 
             if status == 'error':
                 print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - DECODE-ERR  {name}", flush=True)
-                done_log.write(name + '\n'); done_log.flush()
+                _write_done(name)
                 continue
 
             try:
                 landmarks, frames_gpu = _infer_with_oom_retry(fast_pipeline, frames)
-            except torch.cuda.OutOfMemoryError:
-                # Đã thử OOM_MAX_ATTEMPTS lần với chunk giảm dần mà vẫn OOM.
-                # Defer sang retry pass (1-worker) thay vì đánh dấu done.
-                if oom_log is not None:
-                    tag = "OOM-DEFER "
-                    oom_log.write(f + '\n'); oom_log.flush()
-                else:
-                    # Đang ở retry pass — không có tầng dự phòng tiếp theo, bỏ luôn.
-                    tag = "OOM-FINAL "
-                    done_log.write(name + '\n'); done_log.flush()
-                print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - {tag} {name}", flush=True)
-                # Giải phóng tham chiếu frames (RAM lớn) và GPU cache trước khi tiếp tục
-                del frames
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                continue
             except Exception as _infer_exc:
+                # Phân nhánh: OOM (kể cả khi bị TorchScript bọc thành RuntimeError)
+                # vs. lỗi inference khác. Trước đây chỉ bắt torch.cuda.OutOfMemoryError
+                # khiến OOM trong scripted module bị xem nhầm là INFER-ERR và đánh dấu
+                # done luôn — file đó mất hết cơ hội retry.
+                if _is_cuda_oom(_infer_exc):
+                    # Đã thử OOM_MAX_ATTEMPTS lần với chunk giảm dần mà vẫn OOM.
+                    # Defer sang retry pass (1-worker) thay vì đánh dấu done.
+                    if oom_log is not None:
+                        tag = "OOM-DEFER "
+                        _write_oom(f)
+                    else:
+                        # Đang ở retry pass — không có tầng dự phòng tiếp theo, bỏ luôn.
+                        tag = "OOM-FINAL "
+                        _write_done(name)
+                    print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - {tag} {name}", flush=True)
+                    # Giải phóng tham chiếu frames (RAM lớn) và GPU cache trước khi tiếp tục
+                    del frames
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    continue
+
+                # Không phải OOM → INFER-ERR thật, đánh dấu done để khỏi retry vô hạn
                 import traceback as _tb
                 print(f"[{ts}] {idx}/{total_files} W{worker_id}/G{gpu_id} - INFER-ERR   {name} | {type(_infer_exc).__name__}: {_infer_exc!s:.200}", flush=True)
                 _tb.print_exc()
-                done_log.write(name + '\n'); done_log.flush()
+                _write_done(name)
                 continue
 
             # Hand off immediately — GPU loop does NOT wait for crop
@@ -387,19 +469,67 @@ def _shard_suffixes(num_workers):
     return suffixes
 
 
+def _dedup_csv_inplace(path):
+    """Loại dòng trùng theo cột 'video/{name}' (cột thứ 2) — giữ entry CUỐI.
+    BUG 6 fix: nếu worker chết giữa CSV-write và done_log-write, file sẽ
+    được xử lý lại lần sau → CSV xuất hiện 2 row cho cùng video. Hàm này
+    consolidate sau merge để dataset cuối cùng sạch.
+    """
+    if not os.path.exists(path):
+        return
+    seen = {}
+    order = []  # giữ thứ tự xuất hiện đầu tiên cho ổn định
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            parts = line.split(',', 2)
+            key = parts[1] if len(parts) >= 2 else line
+            if key not in seen:
+                order.append(key)
+            seen[key] = line  # ghi đè → giữ row mới nhất
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        for key in order:
+            f.write(seen[key])
+    os.replace(tmp, path)
+
+
+def _dedup_lines_inplace(path):
+    """Loại dòng trùng (so sánh nguyên vẹn). Dùng cho DONE_LOG."""
+    if not os.path.exists(path):
+        return
+    seen = set()
+    out_lines = []
+    with open(path) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out_lines.append(line if line.endswith('\n') else line + '\n')
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        f.writelines(out_lines)
+    os.replace(tmp, path)
+
+
 def merge_shards(num_workers):
     """Merge per-worker CSV + done-log shards into the canonical files.
     Bao gồm cả shard từ retry pass (suffix '.retry').
+    Sau khi merge, dedup file gộp để loại trùng do crash giữa các stage.
     """
     suffixes = _shard_suffixes(num_workers)
     for split in ('train', 'val', 'test'):
-        with open(f"{LABELS_DIR}/{split}.csv", "a") as out:
+        canonical = f"{LABELS_DIR}/{split}.csv"
+        with open(canonical, "a") as out:
             for sfx in suffixes:
                 shard = f"{LABELS_DIR}/{split}_{sfx}.csv"
                 if os.path.exists(shard):
                     with open(shard) as inp:
                         out.write(inp.read())
                     os.remove(shard)
+        _dedup_csv_inplace(canonical)
     with open(DONE_LOG, "a") as out:
         for sfx in suffixes:
             shard = f"{DONE_LOG}.{sfx}"
@@ -407,6 +537,7 @@ def merge_shards(num_workers):
                 with open(shard) as inp:
                     out.write(inp.read())
                 os.remove(shard)
+    _dedup_lines_inplace(DONE_LOG)
 
 
 def collect_oom_files(num_workers):
@@ -477,15 +608,19 @@ if __name__ == '__main__':
             os.makedirs(dirpath, exist_ok=True)
             print(f"Created directory: {dirpath}")
 
-    # Probe NVENC once so workers know whether to attempt it
+    # Probe NVENC once so workers know whether to attempt it.
+    # BUG 2 fix: với 'spawn' start_method, gán _NVENC_OK ở __main__ KHÔNG
+    # truyền qua worker (mỗi worker re-import module). Phải lưu kết quả probe
+    # vào biến local rồi truyền qua worker args.
     import numpy as _np
     _probe = _np.zeros((4, 256, 256, 3), dtype=_np.uint8)
+    nvenc_ok = True
     try:
         _write_video_pyav('/tmp/_nvenc_probe.mp4', _probe, 25,
                           'h264_nvenc', {'preset': 'p1', 'gpu': '0'})
         print("NVENC: available — using hardware encoding")
     except Exception as _e:
-        _NVENC_OK = False
+        nvenc_ok = False
         print(f"NVENC: unavailable ({_e}) — using libx264 ultrafast")
     del _probe
 
@@ -516,6 +651,7 @@ if __name__ == '__main__':
             done=len(done_set),          # already-completed files count toward progress
             total=len(files),
             initial_done=len(done_set),  # snapshot for filtering log spam
+            saved=len(done_set),         # BUG 7 fix: completed-save counter, riêng với 'done' (dispatch)
         )
 
         args = []
@@ -525,7 +661,9 @@ if __name__ == '__main__':
                 wid, gpu_id, chunks[wid],
                 train_set, val_set, test_set,
                 done_set, lock, counters, start,
-                False,  # retry_mode
+                False,           # retry_mode
+                total_workers,   # BUG 4 fix: actual count, not config
+                nvenc_ok,        # BUG 2 fix: propagate probe result to spawn workers
             ))
 
         with Pool(processes=total_workers) as pool:
@@ -549,12 +687,15 @@ if __name__ == '__main__':
                 done=0,
                 total=len(oom_files),
                 initial_done=0,
+                saved=0,  # BUG 7
             )
             retry_args = [(
                 0, 0, oom_files,
                 train_set, val_set, test_set,
                 done_set_retry, lock_r, counters_r, time.time(),
-                True,  # retry_mode
+                True,        # retry_mode
+                1,           # total_workers (retry pass = 1 worker)
+                nvenc_ok,    # propagate probe result
             )]
             with Pool(processes=1) as pool:
                 pool.starmap(worker, retry_args)

@@ -22,3 +22,5 @@ vnlr/
 onstart.sh
 ports.log
 face_detection/
+/face_alignment/
+/face_detection/
