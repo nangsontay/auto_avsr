@@ -18,6 +18,11 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - PYTHONUNBUFFERED=1
+      # Reduce CUDA allocator fragmentation when CUDAGraph holds private memory
+      # pools (torch.compile reduce-overhead mode). expandable_segments=True
+      # lets the allocator grow segments instead of fragmenting on each new
+      # CUDAGraph capture; max_split_size_mb caps splitting overhead.
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
     volumes:
       # Dataset gốc (read-only để an toàn)
       - /data/gdrive/VNLR/VNLR:/app/dataset:ro

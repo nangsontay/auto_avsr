@@ -10,8 +10,39 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ibug.face_detection.retina_face.prior_box import PriorBox
 
-# Module-level thread pool for face-crop resizes (cv2 releases GIL)
-_FACE_CROP_POOL = ThreadPoolExecutor(max_workers=8)
+# Module-level thread pool for face-crop resizes (cv2 releases GIL).
+# Sized adaptively: scale with CPU count but cap to avoid oversubscription on
+# small machines. On 8-core: 4 thread; on 32-core: 8 thread (cap).
+import os as _os
+_CROP_POOL_SIZE = max(2, min(8, (_os.cpu_count() or 4) // 2))
+_FACE_CROP_POOL = ThreadPoolExecutor(max_workers=_CROP_POOL_SIZE)
+
+
+def _build_buckets(max_chunk: int, levels: int = 4, min_size: int = 32):
+    """Build a small set of fixed batch-size buckets from `max_chunk` down to
+    `min_size` by halving. Returns ascending list, e.g. for max_chunk=512:
+    [64, 128, 256, 512]. The bucket scheme caps unique CUDAGraph shapes per
+    compiled net to len(buckets), keeping CUDAGraph replay benefits while
+    bounding padding waste to <2x worst-case."""
+    buckets, b = [], int(max_chunk)
+    for _ in range(levels):
+        if b < min_size:
+            break
+        buckets.append(b)
+        b //= 2
+    buckets = sorted(set(buckets))
+    if not buckets or buckets[0] > min_size:
+        buckets.insert(0, min_size)
+    return buckets
+
+
+def _next_bucket(n: int, buckets) -> int:
+    """Smallest bucket >= n. If n exceeds the largest bucket, return n itself
+    (caller must already have ensured n <= max_chunk via the chunked loop)."""
+    for b in buckets:
+        if b >= n:
+            return b
+    return n
 
 
 class BatchedLandmarkPipeline:
@@ -28,6 +59,13 @@ class BatchedLandmarkPipeline:
         self.fan_chunk   = fan_chunk
         self.fp16        = fp16
         self.priors_cache = {}
+
+        # Bucket sizes for ragged tail batches. Padding to one of a few fixed
+        # shapes (instead of pad-to-max) caps CUDAGraph re-records to len(buckets)
+        # per compiled net, while keeping padding waste bounded (<2x worst case,
+        # ~25% average) — see PyTorch CUDAGraph dynamic-shape recommendation.
+        self.det_buckets = _build_buckets(det_chunk, levels=4)
+        self.fan_buckets = _build_buckets(fan_chunk, levels=4)
 
         self._mean = torch.tensor([104., 117., 123.], device=device).view(1, 3, 1, 1)
 
@@ -76,12 +114,27 @@ class BatchedLandmarkPipeline:
         i = 0
         det_chunk = self.det_chunk
         while i < N:
+            chunk = frames_bgr[i:i + det_chunk]
+            B = chunk.size(0)
+            # Round up to the nearest bucket so torch.compile/CUDAGraph re-uses
+            # one of len(self.det_buckets) recorded graphs (instead of one per
+            # unique tail size). Skip padding when B already matches a bucket.
+            target = _next_bucket(B, self.det_buckets)
             try:
-                chunk = frames_bgr[i:i + det_chunk]
-                x = chunk.permute(0, 3, 1, 2).float() - self._mean
+                if target > B:
+                    pad_n = target - B
+                    chunk_padded = torch.cat(
+                        [chunk, chunk[-1:].expand(pad_n, -1, -1, -1)], dim=0
+                    )
+                else:
+                    chunk_padded = chunk
+                x = chunk_padded.permute(0, 3, 1, 2).float() - self._mean
                 if self.fp16:
                     x = x.half()
                 loc, conf, _ = self.face_net(x)
+                # Drop padding rows before downstream math
+                loc = loc[:B]
+                conf = conf[:B]
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 if det_chunk == 1:
@@ -91,7 +144,6 @@ class BatchedLandmarkPipeline:
             scores = conf[..., 1].float()
             top_score, top_idx = scores.max(dim=1)
 
-            B = chunk.size(0)
             bi = torch.arange(B, device=self.device)
             top_loc = loc[bi, top_idx].float()
             tp = priors[top_idx]
@@ -164,9 +216,22 @@ class BatchedLandmarkPipeline:
         chunk = self.fan_chunk
         N_patch = patches_t.size(0)
         while i < N_patch:
+            sub = patches_t[i:i + chunk]
+            real_b = sub.size(0)
+            # Round up to the nearest FAN bucket so CUDAGraph re-uses one of
+            # len(self.fan_buckets) recorded graphs.
+            target = _next_bucket(real_b, self.fan_buckets)
             try:
-                heatmaps, _, _ = self.fan_net(patches_t[i:i + chunk])
-                all_lm.append(self._decode_fan(heatmaps))
+                if target > real_b:
+                    pad_n = target - real_b
+                    sub_padded = torch.cat(
+                        [sub, sub[-1:].expand(pad_n, -1, -1, -1)], dim=0
+                    )
+                else:
+                    sub_padded = sub
+                heatmaps, _, _ = self.fan_net(sub_padded)
+                # Drop padding rows before decoding
+                all_lm.append(self._decode_fan(heatmaps[:real_b]))
                 i += chunk
             except torch.cuda.OutOfMemoryError:
                 # Giải phóng buffer và thử với chunk nhỏ hơn
